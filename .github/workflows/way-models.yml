@@ -1,46 +1,93 @@
-# Workflow для ПУБЛИЧНОГО репозитория novruzluturqut-maker/way-models (положить в .github/workflows/way-models.yml).
-# Качает GGUF с Hugging Face (нужен секрет HF_TOKEN — Read-токен) и выкладывает их как Release `v1` этого репозитория:
-# телефон потом скачивает по https://github.com/novruzluturqut-maker/way-models/releases/download/v1/<файл> без всяких токенов.
-# Лимит GitHub на файл релиза — 2 ГиБ, поэтому берём квантизации ≤ 2 ГБ.
 name: WaY models
 on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Тег релиза"
+        description: "Release tag"
         default: "v1"
 permissions:
   contents: write
 jobs:
   publish:
     runs-on: ubuntu-latest
-    timeout-minutes: 120
+    env:
+      TAG: ${{ github.event.inputs.tag || 'v1' }}
     steps:
-      - name: Скачать модели с Hugging Face
+      - name: Скачать модели с Hugging Face (поиск файлов через API)
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
         run: |
-          set -e; mkdir -p out; cd out
           test -n "$HF_TOKEN" || { echo "::error::нет секрета HF_TOKEN"; exit 1; }
-          dl() { # url имя
-            echo "== $2"; curl -sSL --fail --retry 3 -H "Authorization: Bearer $HF_TOKEN" -o "$2" "$1"
-            head -c 4 "$2" | grep -q GGUF || { echo "::error::$2 — не GGUF (ответ сервера?)"; head -c 300 "$2"; exit 1; }
-            s=$(stat -c %s "$2"); echo "$2 $s байт"; [ "$s" -lt 2147483000 ] || { echo "::warning::$2 больше 2 ГиБ — релиз не примет, пропускаю"; rm -f "$2"; }
-          }
-          dl "https://huggingface.co/Triangle104/Qwen2.5-3B-Instruct-abliterated-Q4_K_M-GGUF/resolve/main/qwen2.5-3b-instruct-abliterated-q4_k_m.gguf" qwen2.5-3b-instruct-abliterated-q4_k_m.gguf
-          dl "https://huggingface.co/mav23/Qwen2.5-3B-Instruct-abliterated-GGUF/resolve/main/qwen2.5-3b-instruct-abliterated.Q3_K_M.gguf" qwen2.5-3b-instruct-abliterated.Q3_K_M.gguf
-          dl "https://huggingface.co/mav23/Llama-3.2-3B-Instruct-abliterated-GGUF/resolve/main/llama-3.2-3b-instruct-abliterated.Q4_K_S.gguf" llama-3.2-3b-instruct-abliterated.Q4_K_S.gguf || true
-          ls -la
+          mkdir -p out; cd out
           python3 - <<'EOF'
-          import json, os, glob
-          files = sorted(glob.glob('*.gguf'))
-          json.dump({'tag': os.environ.get('TAG', 'v1'), 'files': [{'name': f, 'size': os.path.getsize(f)} for f in files]}, open('models.json', 'w'), ensure_ascii=False, indent=1)
-          print(open('models.json').read())
+          import json, os, sys, urllib.request, urllib.parse
+          T = os.environ["HF_TOKEN"]
+          LIM = 2147483000
+          def get(url):
+              r = urllib.request.Request(url, headers={"Authorization": "Bearer " + T})
+              return urllib.request.urlopen(r, timeout=60)
+          def api(path):
+              try:
+                  return json.load(get("https://huggingface.co/api/" + path))
+              except Exception as e:
+                  print("  api", path, "->", e); return None
+          def files_of(repo):
+              m = api("models/" + repo + "?blobs=true")
+              if not m: return []
+              return [(s["rfilename"], s.get("size") or 0) for s in m.get("siblings", []) if s["rfilename"].lower().endswith(".gguf")]
+          def search(q):
+              r = api("models?search=" + urllib.parse.quote(q) + "&limit=30&sort=downloads&direction=-1") or []
+              return [x["id"] for x in r]
+          # (имя для приложения, [репо-кандидаты], [маркеры квантизации], поисковый запрос)
+          WANT = [
+              ("qwen2.5-3b-instruct-abliterated-q4_k_m.gguf", ["Triangle104/Qwen2.5-3B-Instruct-abliterated-Q4_K_M-GGUF"], ["q4_k_m"], "Qwen2.5-3B-Instruct-abliterated gguf", ["qwen2.5-3b", "qwen2.5-3b-instruct"]),
+              ("qwen2.5-3b-instruct-abliterated.Q3_K_M.gguf", ["mav23/Qwen2.5-3B-Instruct-abliterated-GGUF"], ["q3_k_m"], "Qwen2.5-3B-Instruct-abliterated gguf", ["qwen2.5-3b"]),
+              ("llama-3.2-3b-instruct-abliterated.Q4_K_S.gguf", ["mav23/Llama-3.2-3B-Instruct-abliterated-GGUF"], ["q4_k_s", "q4_k_m"], "Llama-3.2-3B-Instruct-abliterated gguf", ["llama-3.2-3b"]),
+          ]
+          done = []
+          for out, repos, quants, q, must in WANT:
+              print("==", out)
+              cands = list(repos) + [r for r in search(q) if r not in repos]
+              pick = None
+              for repo in cands:
+                  if not all(any(m in repo.lower() for m in [x]) or True for x in must): pass
+                  if not any(m in repo.lower() for m in must): continue
+                  if "abliterated" not in repo.lower(): continue
+                  fs = files_of(repo)
+                  for qn in quants:
+                      for fn, sz in fs:
+                          if qn in fn.lower() and "abliterated" in (fn + repo).lower() and 0 < sz < LIM:
+                              pick = (repo, fn, sz); break
+                      if pick: break
+                  if pick: break
+              if not pick:
+                  print("::warning::не нашёл", out); continue
+              repo, fn, sz = pick
+              print("  ->", repo, fn, sz)
+              url = "https://huggingface.co/%s/resolve/main/%s" % (repo, urllib.parse.quote(fn))
+              try:
+                  with get(url) as r, open(out, "wb") as f:
+                      while True:
+                          b = r.read(1 << 20)
+                          if not b: break
+                          f.write(b)
+              except Exception as e:
+                  print("::warning::скачивание не удалось", out, e);
+                  if os.path.exists(out): os.remove(out)
+                  continue
+              if open(out, "rb").read(4) != b"GGUF":
+                  print("::warning::не GGUF", out); os.remove(out); continue
+              s = os.path.getsize(out); print("  ok", out, s)
+              done.append({"name": out, "size": s, "source": repo + "/" + fn})
+          if not done:
+              print("::error::ни одной модели не скачано"); sys.exit(1)
+          json.dump({"tag": os.environ.get("TAG", "v1"), "files": done}, open("models.json", "w"), ensure_ascii=False, indent=1)
+          print(open("models.json").read())
           EOF
+          ls -la
       - name: Релиз
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          TAG: ${{ inputs.tag }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           cd out
           gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 || gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --title "Модели WaY $TAG" --notes "GGUF без цензуры для локального Мага. Скачиваются приложением WaY Рунология."
